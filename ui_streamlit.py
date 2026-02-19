@@ -392,17 +392,163 @@ def reconcile(left: pd.DataFrame, right: pd.DataFrame, keys: list[str]) -> dict:
     return {"left_only": left_only, "right_only": right_only, "diffs": diffs}
 
 def page_analyse():
-    st.header("📊 Analyse data (CSV)")
-    st.caption("Profile CSVs and/or reconcile two datasets by keys (diff report).")
+    import os, zipfile
+
+    st.header("📊 Analyse data")
+    st.caption("Profile CSVs, reconcile two CSVs, or analyse BW flow dependencies from your extractor output.")
 
     subtask = st.selectbox("Choose Data sub-task", [
         "Profile CSV(s)",
-        "Reconcile two CSVs (diff by keys)"
+        "Reconcile two CSVs (diff by keys)",
+        "BW Dependency (folder/zip)"          # <-- NEW
     ])
 
-    with st.expander("Advanced prompts (optional)"):
-        notes = st.text_area("Business notes / validation rules to append into reports", height=120)
+    # ---------- helpers specific to the new dependency analysis ----------
+    def _extract_zip_to_tmp(uploaded_zip):
+        tmp = Path(tempfile.mkdtemp())
+        zf = zipfile.ZipFile(io.BytesIO(uploaded_zip.getvalue()))
+        zf.extractall(tmp)
+        return tmp
 
+    def _find_dependency_logs(root: Path):
+        """
+        Return a list of (use_case_name, log_path) tuples.
+        Rules we implement:
+          - A 'use case' is each top-level folder under root (or any folder the user points at).
+          - Under a use case, look for a folder named 'transformation' (case-insensitive).
+          - Inside 'transformation', pick files named 'dependency_log*' or 'dependencies_log*'
+            (e.g., 'dependency_log', 'dependencies_log.txt', etc.)
+          - If multiple logs exist under a use case, collect them all.
+        """
+        hits = []
+        for dirpath, dirnames, filenames in os.walk(root):
+            # detect 'transformation' level
+            if os.path.basename(dirpath).lower().startswith("transformation"):
+                # use case = the folder two levels up (typically)
+                # e.g., <root>/<usecase>/transformation/...
+                # fallback: the parent of this 'transformation' folder
+                trans_dir = Path(dirpath)
+                parent = trans_dir.parent
+                usecase = parent.name  # default
+                # If there is yet another folder above (some exports nest), keep it simple for now.
+
+                for fn in filenames:
+                    low = fn.lower()
+                    if low.startswith("dependency_log") or low.startswith("dependencies_log"):
+                        hits.append((usecase, trans_dir / fn))
+        return hits
+
+    FM_NAME_RE = re.compile(
+        r"(?<![A-Z0-9_/])"                # left boundary not a typical name char
+        r"(?:/[A-Z0-9_]+/)?[A-Z][A-Z0-9_]{2,}"  # supports /SAPAPO/ prefixes and uppercase names
+    )
+
+    def _extract_fms_from_text(text: str) -> set[str]:
+        """
+        Try to be robust:
+          - Pick up lines that mention 'Function module' or 'FUNCTION MODULE' or 'type function module'.
+          - Extract words that look like FM names (Z_..., Y_..., standard like RS*, or /SAPAPO/*).
+        """
+        fms = set()
+        for ln in text.splitlines():
+            if re.search(r"\b(function\s*module|fm:|type\s*function\s*module)\b", ln, flags=re.I):
+                # extract candidates
+                for cand in FM_NAME_RE.findall(ln):
+                    # filter obvious noise tokens
+                    if cand.upper() in {"FUNCTION", "MODULE", "TYPE", "VALUE"}:
+                        continue
+                    fms.add(cand.upper())
+        # fallback: if no lines match the phrase, still try to parse all-cap tokens heuristically
+        if not fms:
+            for cand in FM_NAME_RE.findall(text):
+                # keep only custom/standard FM-like tokens (heuristic)
+                if len(cand) >= 4:
+                    fms.add(cand.upper())
+        return fms
+
+    def _analyse_dependencies(root: Path, user_notes: str = ""):
+        """
+        Crawl the tree, collect per-usecase FMs, invert mapping, and build artifacts.
+        Returns: dict with dataframes and byte-encoded files for zipping.
+        """
+        logs = _find_dependency_logs(root)
+        if not logs:
+            return {"error": "No dependency_log / dependencies_log files were found under any 'transformation' folder."}
+
+        # maps
+        usecase_to_fms: dict[str, set[str]] = {}
+        fm_to_usecases: dict[str, set[str]] = {}
+
+        for usecase, log_path in logs:
+            try:
+                txt = Path(log_path).read_text(encoding="utf-8", errors="ignore")
+            except Exception:
+                txt = Path(log_path).read_text(encoding="latin-1", errors="ignore")
+
+            fms = _extract_fms_from_text(txt)
+            if fms:
+                usecase_to_fms.setdefault(usecase, set()).update(fms)
+                for fm in fms:
+                    fm_to_usecases.setdefault(fm, set()).add(usecase)
+
+        # turn into dataframes
+        rows_uc = []
+        for uc, fms in sorted(usecase_to_fms.items()):
+            for fm in sorted(fms):
+                rows_uc.append({"use_case": uc, "function_module": fm})
+        df_uc = pd.DataFrame(rows_uc).sort_values(["use_case","function_module"]) if rows_uc else pd.DataFrame(columns=["use_case","function_module"])
+
+        rows_fm = []
+        for fm, ucs in sorted(fm_to_usecases.items()):
+            for uc in sorted(ucs):
+                rows_fm.append({"function_module": fm, "use_case": uc})
+        df_fm = pd.DataFrame(rows_fm).sort_values(["function_module","use_case"]) if rows_fm else pd.DataFrame(columns=["function_module","use_case"])
+
+        unique_fm_count = len(fm_to_usecases)
+        summary_md = []
+        summary_md.append("# BW Dependency Analysis")
+        summary_md.append("")
+        summary_md.append(f"- **Use cases scanned:** {len(usecase_to_fms)}")
+        summary_md.append(f"- **Unique Function Modules (FMs):** {unique_fm_count}")
+        # top UC by FM count
+        if not df_uc.empty:
+            top_uc = df_uc.groupby("use_case")["function_module"].nunique().sort_values(ascending=False)
+            summary_md.append("")
+            summary_md.append("## Top use cases by unique FM count")
+            for uc, cnt in top_uc.head(20).items():
+                summary_md.append(f"- {uc}: {cnt}")
+        # top FM by number of use cases
+        if not df_fm.empty:
+            top_fm = df_fm.groupby("function_module")["use_case"].nunique().sort_values(ascending=False)
+            summary_md.append("")
+            summary_md.append("## Top function modules by number of use cases")
+            for fm, cnt in top_fm.head(20).items():
+                summary_md.append(f"- {fm}: {cnt}")
+        if user_notes:
+            summary_md.append("")
+            summary_md.append("## Notes")
+            summary_md.append(user_notes)
+
+        # bundle files
+        zip_files = {}
+        zip_files["summary/overview.md"] = "\n".join(summary_md).encode()
+        if not df_uc.empty:
+            zip_files["tables/usecase_to_fms.csv"] = df_uc.to_csv(index=False).encode()
+        if not df_fm.empty:
+            zip_files["tables/fm_to_usecases.csv"] = df_fm.to_csv(index=False).encode()
+
+        return {
+            "df_uc": df_uc,
+            "df_fm": df_fm,
+            "unique_fm_count": unique_fm_count,
+            "zip_bytes": zip_named_files(zip_files)
+        }
+    # ---------- end helpers ----------
+
+    with st.expander("Advanced prompts / notes (optional)"):
+        notes = st.text_area("Add any notes you want embedded into the generated report", height=120)
+
+    # -------- Subtask A: Profile CSV(s) --------
     if subtask == "Profile CSV(s)":
         files = st.file_uploader("Upload one or more CSV files", type=["csv"], accept_multiple_files=True)
         run = st.button("🔎 Profile", type="primary")
@@ -418,33 +564,30 @@ def page_analyse():
                 with tabs[i]:
                     st.subheader(f"Preview — {f.name}")
                     st.dataframe(df.head(200))
-                    # simple nulls chart
                     nulls = {c["column"]: c["nulls"] for c in rpt["columns_profile"]}
                     st.caption("Nulls per column")
                     st.bar_chart(pd.Series(nulls))
-                # Save JSON & Markdown
-                j = json.dumps(rpt, indent=2).encode()
-                m = [f"# Data Profile: {f.name}", f"Rows: {rpt['rows']}", f"Columns: {rpt['columns']}", ""]
-                if notes: m += ["## Notes", notes, ""]
-                m += ["## Columns"]
+                outputs[f"{f.name}/{Path(f.name).stem}_profile.json"] = json.dumps(rpt, indent=2).encode()
+                md = ["# Data Profile", f"**File:** {f.name}", f"**Rows:** {rpt['rows']}", f"**Columns:** {rpt['columns']}", ""]
+                if notes: md += ["## Notes", notes, ""]
+                md += ["## Columns"]
                 for c in rpt["columns_profile"]:
                     row = f"- **{c['column']}** (`{c['dtype']}`) non_null={c['non_null']}, nulls={c['nulls']}, distinct={c['distinct']}"
                     for k in ["min","max","mean","std"]:
                         if k in c:
                             row += f", {k}={c[k]}"
-                    m.append(row)
-                outputs[f"{f.name}/{Path(f.name).stem}_profile.json"] = j
-                outputs[f"{f.name}/{Path(f.name).stem}_profile.md"] = "\n".join(m).encode()
+                    md.append(row)
+                outputs[f"{f.name}/{Path(f.name).stem}_profile.md"] = "\n".join(md).encode()
             st.success("Profiling completed.")
             st.download_button("📦 Download all profiles (ZIP)", data=zip_named_files(outputs),
                                file_name="data_profiles.zip", mime="application/zip")
 
-    else:
+    # -------- Subtask B: Reconcile two CSVs --------
+    elif subtask == "Reconcile two CSVs (diff by keys)":
         left = st.file_uploader("Left CSV", type=["csv"])
         right = st.file_uploader("Right CSV", type=["csv"])
         key_line = st.text_input("Join keys (comma-separated)", value="")
         run = st.button("🔁 Reconcile", type="primary")
-
         if run:
             if not (left and right and key_line.strip()):
                 st.error("Upload two CSVs and provide join keys.")
@@ -458,14 +601,10 @@ def page_analyse():
                 return
             out = reconcile(dfL, dfR, keys)
             st.success("Reconciliation completed.")
-
-            # Show summaries
             st.subheader("Summary")
             st.write(f"Left only rows: {len(out['left_only'])}")
             st.write(f"Right only rows: {len(out['right_only'])}")
             st.write(f"Columns with differences: {len(out['diffs'])}")
-
-            # Pack results
             files = {}
             files["summary/notes.md"] = (notes or "").encode()
             if len(out["left_only"])>0:
@@ -474,10 +613,67 @@ def page_analyse():
                 files["summary/right_only.csv"] = out["right_only"].to_csv(index=False).encode()
             for col, df in out["diffs"]:
                 files[f"diffs/{col}_mismatch.csv"] = df.to_csv(index=False).encode()
-
             st.download_button("📦 Download reconciliation ZIP", data=zip_named_files(files),
                                file_name="reconcile.zip", mime="application/zip")
 
+    # -------- Subtask C: BW Dependency (folder/zip) --------
+    else:
+        st.info("📁 This finds **transformation/dependency_log** (or **dependencies_log**) under each use-case folder and analyses which Function Modules are used where.")
+        mode = st.radio("Choose input mode", ["Upload ZIP (works on Streamlit Cloud)", "Local folder path (run locally)"])
+        zip_up = None
+        root_path = None
+
+        if mode == "Upload ZIP (works on Streamlit Cloud)":
+            zip_up = st.file_uploader("Upload a ZIP of your extractor output root", type=["zip"])
+        else:
+            root_path = st.text_input("Full local path to extractor output root (only for local runs)", value="", placeholder=r"C:\temp\bw_export_root")
+
+        run = st.button("🧩 Analyse dependencies", type="primary")
+        if run:
+            # resolve root folder
+            if zip_up:
+                root = _extract_zip_to_tmp(zip_up)
+            else:
+                if not root_path:
+                    st.error("Provide a local path or upload a ZIP.")
+                    return
+                root = Path(root_path)
+                if not root.exists():
+                    st.error(f"Path not found: {root}")
+                    return
+
+            result = _analyse_dependencies(root, notes or "")
+            if "error" in result:
+                st.error(result["error"])
+                return
+
+            # on-screen views
+            st.success(f"Unique Function Modules (FMs) across all use cases: **{result['unique_fm_count']}**")
+            tabs = st.tabs(["Use case → FMs", "FM → Use cases"])
+            with tabs[0]:
+                if result["df_uc"].empty:
+                    st.write("No FM references were found.")
+                else:
+                    # Top use-cases by FM count
+                    top = result["df_uc"].groupby("use_case")["function_module"].nunique().sort_values(ascending=False).head(20)
+                    st.caption("Top use cases by unique FM count")
+                    st.bar_chart(top)
+                    st.dataframe(result["df_uc"])
+            with tabs[1]:
+                if result["df_fm"].empty:
+                    st.write("No FM references were found.")
+                else:
+                    # Top FMs by number of use cases
+                    top = result["df_fm"].groupby("function_module")["use_case"].nunique().sort_values(ascending=False).head(20)
+                    st.caption("Top function modules by number of use cases")
+                    st.bar_chart(top)
+                    st.dataframe(result["df_fm"])
+
+            # download
+            st.download_button("📦 Download dependency bundle (ZIP)",
+                               data=result["zip_bytes"],
+                               file_name="bw_dependency_analysis.zip",
+                               mime="application/zip")
 # ---------------------------------------------------------------------------
 # Sidebar router
 # ---------------------------------------------------------------------------
