@@ -1,0 +1,13 @@
+# streamlit_app.py — Home
+import streamlit as st, os
+st.set_page_config(page_title="BEx / FM / Data Suite", page_icon="🧭", layout="wide")
+
+st.title("🧭 BEx / FM / Data Suite")
+st files → JSON spec + docs + test data (+ optional PySpark).st.write("""
+- **Function Module conversion** — Parse ABAP FM source → spec + docs + Python stub (+ pytest).
+- **Analyse data** — Profile CSVs, reconcile datasets, or analyse BW dependency logs.
+""")
+
+st.caption(f"__file__ = {__file__}")
+st.caption(f"CWD = {os.getcwd()}")
+Welcome! Use the sidebar to open:
