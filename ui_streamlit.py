@@ -15,6 +15,25 @@ import io, zipfile, tempfile, re, json, textwrap
 
 # Import your existing BEx agent
 import agent
+# --- ADD these helpers near other helpers (top of file is fine) ---
+import os, zipfile
+
+def _extract_zip_to_tmp(uploaded_zip):
+    """Extract an uploaded ZIP into a temp folder and return Path."""
+    tmp = Path(tempfile.mkdtemp())
+    zf = zipfile.ZipFile(io.BytesIO(uploaded_zip.getvalue()))
+    zf.extractall(tmp)
+    return tmp
+
+def _iter_files(root: Path, exts: tuple[str, ...]) -> list[Path]:
+    """Walk a folder and return every file whose suffix is in exts (case‑insensitive)."""
+    out = []
+    lower_exts = tuple(e.lower() for e in exts)
+    for dirpath, _, filenames in os.walk(root):
+        for fn in filenames:
+            if Path(fn).suffix.lower() in lower_exts:
+                out.append(Path(dirpath) / fn)
+    return out
 
 st.set_page_config(page_title="BEx / FM / Data Suite", page_icon="🧭", layout="wide")
 
