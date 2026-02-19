@@ -367,3 +367,128 @@ def quick_profile(df: pd.DataFrame, dataset: str) -> dict:
                 info.update({
                     "min": float(valid.min()),
                     "max": float(valid.max()),
+                    "mean": float(valid.mean()),
+                    "std": float(valid.std(ddof=0)),
+                })
+        cols.append(info)
+    return {"dataset": dataset, "rows": int(len(df)), "columns": int(df.shape[1]), "columns_profile": cols}
+
+def reconcile(left: pd.DataFrame, right: pd.DataFrame, keys: list[str]) -> dict:
+    # Returns left_only, right_only, mismatches per key (row-level comparison)
+    merge = left.merge(right, on=keys, how="outer", indicator=True, suffixes=("_L","_R"))
+    left_only  = merge[merge["_merge"]=="left_only"]
+    right_only = merge[merge["_merge"]=="right_only"]
+    both = merge[merge["_merge"]=="both"].drop(columns=["_merge"])
+
+    # Find differing non-key columns
+    non_keys = [c for c in left.columns if c not in keys]
+    diffs = []
+    for c in non_keys:
+        lc, rc = f"{c}_L", f"{c}_R"
+        if lc in both.columns and rc in both.columns:
+            d = both[both[lc].astype(str) != both[rc].astype(str)]
+            if not d.empty:
+                diffs.append((c, d[keys + [lc, rc]]))
+    return {"left_only": left_only, "right_only": right_only, "diffs": diffs}
+
+def page_analyse():
+    st.header("📊 Analyse data (CSV)")
+    st.caption("Profile CSVs and/or reconcile two datasets by keys (diff report).")
+
+    subtask = st.selectbox("Choose Data sub-task", [
+        "Profile CSV(s)",
+        "Reconcile two CSVs (diff by keys)"
+    ])
+
+    with st.expander("Advanced prompts (optional)"):
+        notes = st.text_area("Business notes / validation rules to append into reports", height=120)
+
+    if subtask == "Profile CSV(s)":
+        files = st.file_uploader("Upload one or more CSV files", type=["csv"], accept_multiple_files=True)
+        run = st.button("🔎 Profile", type="primary")
+        if run:
+            if not files:
+                st.error("Please upload at least one CSV.")
+                return
+            outputs = {}
+            tabs = st.tabs([f.name for f in files])
+            for i,f in enumerate(files):
+                df = pd.read_csv(io.BytesIO(f.getvalue()))
+                rpt = quick_profile(df, f.name)
+                with tabs[i]:
+                    st.subheader(f"Preview — {f.name}")
+                    st.dataframe(df.head(200))
+                    # simple nulls chart
+                    nulls = {c["column"]: c["nulls"] for c in rpt["columns_profile"]}
+                    st.caption("Nulls per column")
+                    st.bar_chart(pd.Series(nulls))
+                # Save JSON & Markdown
+                j = json.dumps(rpt, indent=2).encode()
+                m = [f"# Data Profile: {f.name}", f"Rows: {rpt['rows']}", f"Columns: {rpt['columns']}", ""]
+                if notes: m += ["## Notes", notes, ""]
+                m += ["## Columns"]
+                for c in rpt["columns_profile"]:
+                    row = f"- **{c['column']}** (`{c['dtype']}`) non_null={c['non_null']}, nulls={c['nulls']}, distinct={c['distinct']}"
+                    for k in ["min","max","mean","std"]:
+                        if k in c:
+                            row += f", {k}={c[k]}"
+                    m.append(row)
+                outputs[f"{f.name}/{Path(f.name).stem}_profile.json"] = j
+                outputs[f"{f.name}/{Path(f.name).stem}_profile.md"] = "\n".join(m).encode()
+            st.success("Profiling completed.")
+            st.download_button("📦 Download all profiles (ZIP)", data=zip_named_files(outputs),
+                               file_name="data_profiles.zip", mime="application/zip")
+
+    else:
+        left = st.file_uploader("Left CSV", type=["csv"])
+        right = st.file_uploader("Right CSV", type=["csv"])
+        key_line = st.text_input("Join keys (comma-separated)", value="")
+        run = st.button("🔁 Reconcile", type="primary")
+
+        if run:
+            if not (left and right and key_line.strip()):
+                st.error("Upload two CSVs and provide join keys.")
+                return
+            keys = [k.strip() for k in key_line.split(",") if k.strip()]
+            dfL = pd.read_csv(io.BytesIO(left.getvalue()))
+            dfR = pd.read_csv(io.BytesIO(right.getvalue()))
+            missing_keys = [k for k in keys if k not in dfL.columns or k not in dfR.columns]
+            if missing_keys:
+                st.error(f"Keys not found in both files: {missing_keys}")
+                return
+            out = reconcile(dfL, dfR, keys)
+            st.success("Reconciliation completed.")
+
+            # Show summaries
+            st.subheader("Summary")
+            st.write(f"Left only rows: {len(out['left_only'])}")
+            st.write(f"Right only rows: {len(out['right_only'])}")
+            st.write(f"Columns with differences: {len(out['diffs'])}")
+
+            # Pack results
+            files = {}
+            files["summary/notes.md"] = (notes or "").encode()
+            if len(out["left_only"])>0:
+                files["summary/left_only.csv"] = out["left_only"].to_csv(index=False).encode()
+            if len(out["right_only"])>0:
+                files["summary/right_only.csv"] = out["right_only"].to_csv(index=False).encode()
+            for col, df in out["diffs"]:
+                files[f"diffs/{col}_mismatch.csv"] = df.to_csv(index=False).encode()
+
+            st.download_button("📦 Download reconciliation ZIP", data=zip_named_files(files),
+                               file_name="reconcile.zip", mime="application/zip")
+
+# ---------------------------------------------------------------------------
+# Sidebar router
+# ---------------------------------------------------------------------------
+with st.sidebar:
+    st.header("Select tool")
+    tool = st.radio("Module", ["BEx conversion agent", "Function Module conversion", "Analyse data"], index=0)
+    st.caption("Each module comes with sub-options and advanced prompts.")
+
+if tool == "BEx conversion agent":
+    page_bex()
+elif tool == "Function Module conversion":
+    page_fm()
+else:
+    page_analyse()
