@@ -1,5 +1,10 @@
 import streamlit as st
 import os
+st.markdown("""
+    <style>
+        [data-testid="stSidebar"] {display: block !important;}
+    </style>
+""", unsafe_allow_html=True)
 
 st.set_page_config(
     page_title="BEx / FM / Data Suite",
