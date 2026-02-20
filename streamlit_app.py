@@ -1,4 +1,10 @@
 # streamlit_app.py — Home
+st.set_page_config(
+    page_title="BEx / FM / Data Suite",
+    page_icon="🧭",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
 import streamlit as st, os
 st.set_page_config(page_title="BEx / FM / Data Suite", page_icon="🧭", layout="wide")
 
